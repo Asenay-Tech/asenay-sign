@@ -26,6 +26,7 @@ import { requestId } from 'hono/request-id';
 import type { Logger } from 'pino';
 
 import { aiRoute } from './api/ai/route';
+import { asenayRoute } from './api/asenay/route';
 import { downloadRoute } from './api/download/download';
 import { filesRoute } from './api/files/files';
 import { type AppContext, appContext } from './context';
@@ -121,6 +122,9 @@ app.use('/api/v2-beta/*', apiV2RateLimitMiddleware);
 
 // Auth server.
 app.route('/api/auth', auth);
+
+// Asenay: single sign-on from an Asenay workspace (launch.asenayy.com).
+app.route('/api/asenay', asenayRoute);
 
 // Files route.
 app.use('/api/files/upload-pdf', fileRateLimitMiddleware);

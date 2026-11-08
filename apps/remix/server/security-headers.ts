@@ -42,6 +42,8 @@ const EMBED_AUTH_PATH_REGEX = /^\/embed\/auth(\/|\.data|$)/;
  * keeps `/sign` from matching `/signin`/`/signup` and `/d` from matching
  * `/dashboard`.
  */
+const ASENAY_FRAME_ANCESTORS = (process.env.ASENAY_FRAME_ANCESTORS || '').replace(/[^a-z0-9:/.*\s-]/gi, '').trim();
+
 const FRAMEABLE_PATH_REGEX = /^\/(sign|d)(\/|\.data|$)/;
 
 /**
@@ -107,7 +109,8 @@ const buildCspHeader = ({ nonce, kind }: { nonce: string; kind: CspPathKind }) =
   } else if (kind === 'embed-auth') {
     directives.push(`frame-ancestors 'none'`);
   } else {
-    directives.push(`frame-ancestors 'self'`);
+    // Asenay: the app may also be framed by the sites in ASENAY_FRAME_ANCESTORS (the Asenay workspaces).
+    directives.push(`frame-ancestors 'self'${ASENAY_FRAME_ANCESTORS ? ` ${ASENAY_FRAME_ANCESTORS}` : ''}`);
   }
 
   return directives.join('; ');
