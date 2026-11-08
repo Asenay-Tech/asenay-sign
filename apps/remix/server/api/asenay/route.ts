@@ -10,9 +10,10 @@
  * POST /api/asenay/forget closes the organisation of a removed free-trial workspace: its people are
  * signed out and the organisation is unlinked from the workspace. Nothing is deleted.
  */
-import { createHash, createHmac, timingSafeEqual } from 'node:crypto';
+import { createHash, createHmac, randomBytes, timingSafeEqual } from 'node:crypto';
 
 import { onAuthorize } from '@documenso/auth/server/lib/utils/authorizer';
+import { hashString } from '@documenso/lib/server-only/auth/hash';
 import { addUserToOrganisation } from '@documenso/lib/server-only/organisation/accept-organisation-invitation';
 import { createOrganisation } from '@documenso/lib/server-only/organisation/create-organisation';
 import { getSubscriptionClaim } from '@documenso/lib/server-only/subscription/get-subscription-claim';
@@ -70,48 +71,84 @@ const page = (title: string, text: string) =>
   `<div style="max-width:440px;margin:12vh auto;padding:28px;background:#fff;border:1px solid #e5e7eb;border-radius:14px">` +
   `<h1 style="font-size:19px;margin:0 0 8px">${title}</h1><p style="margin:0;color:#374151">${text}</p></div>`;
 
+/** The person's account and their company's organisation + team, created on the first open (see header). */
+const ensure = async (t: Ticket) => {
+  const email = t.email.trim().toLowerCase();
+  const name = (t.name || email).slice(0, 120);
+  const company = (t.company?.name || 'My company').slice(0, 120);
+  const url = orgUrl(t.ext);
+
+  let user = await prisma.user.findFirst({ where: { email } });
+  if (!user) user = await createAdminUser({ name, email });
+  if (user.disabled) return null;
+
+  let org = await prisma.organisation.findFirst({ where: { url }, include: { groups: true, members: true, teams: true } });
+  if (!org) {
+    const claim = await getSubscriptionClaim(INTERNAL_CLAIM_ID.FREE);
+    const created = await createOrganisation({ userId: user.id, name: company, type: OrganisationType.ORGANISATION, url, claim });
+    org = await prisma.organisation.findFirstOrThrow({ where: { id: created.id }, include: { groups: true, members: true, teams: true } });
+  } else if (!org.members.some((m) => m.userId === user.id)) {
+    await addUserToOrganisation({
+      userId: user.id,
+      organisationId: org.id,
+      organisationGroups: org.groups,
+      organisationMemberRole: t.admin ? OrganisationMemberRole.ADMIN : OrganisationMemberRole.MEMBER,
+      bypassEmail: true,
+    });
+  }
+
+  if (!org.teams.length) {
+    // a closed workspace's team may still hold the address: then the new team gets its own
+    const taken = await prisma.team.findFirst({ where: { url } });
+    const teamUrl = taken ? `${url}-${Date.now().toString(36)}` : url;
+    await createTeam({ userId: org.ownerUserId, teamName: company, teamUrl, organisationId: org.id, inheritMembers: true });
+    org = await prisma.organisation.findFirstOrThrow({ where: { id: org.id }, include: { groups: true, members: true, teams: true } });
+  }
+
+  return { user, org };
+};
+
+/** Short-lived API tokens for the Asenay mobile app (one login: the workspace). */
+const MOBILE_TOKEN = 'Asenay mobile';
+const MOBILE_TOKEN_HOURS = 24;
+
 export const asenayRoute = new Hono()
   .get('/sso', async (c) => {
     const t = verify(c.req.query('t'));
     if (!t) return c.html(page('This link is not valid', 'Go back to your workspace and open Sign again.'), 400);
 
-    const email = t.email.trim().toLowerCase();
-    const name = (t.name || email).slice(0, 120);
-    const company = (t.company?.name || 'My company').slice(0, 120);
-    const url = orgUrl(t.ext);
-
-    let user = await prisma.user.findFirst({ where: { email } });
-    if (!user) user = await createAdminUser({ name, email });
-    if (user.disabled) return c.html(page('Your access was switched off', 'Ask the owner of your company’s Sign account.'), 403);
-
-    let org = await prisma.organisation.findFirst({ where: { url }, include: { groups: true, members: true, teams: true } });
-    if (!org) {
-      const claim = await getSubscriptionClaim(INTERNAL_CLAIM_ID.FREE);
-      const created = await createOrganisation({ userId: user.id, name: company, type: OrganisationType.ORGANISATION, url, claim });
-      org = await prisma.organisation.findFirstOrThrow({ where: { id: created.id }, include: { groups: true, members: true, teams: true } });
-    } else if (!org.members.some((m) => m.userId === user.id)) {
-      await addUserToOrganisation({
-        userId: user.id,
-        organisationId: org.id,
-        organisationGroups: org.groups,
-        organisationMemberRole: t.admin ? OrganisationMemberRole.ADMIN : OrganisationMemberRole.MEMBER,
-        bypassEmail: true,
-      });
-    }
-
-    if (!org.teams.length) {
-      // a closed workspace's team may still hold the address: then the new team gets its own
-      const taken = await prisma.team.findFirst({ where: { url } });
-      const teamUrl = taken ? `${url}-${Date.now().toString(36)}` : url;
-      await createTeam({ userId: org.ownerUserId, teamName: company, teamUrl, organisationId: org.id, inheritMembers: true });
-      org = await prisma.organisation.findFirstOrThrow({ where: { id: org.id }, include: { groups: true, members: true, teams: true } });
-    }
+    const m = await ensure(t);
+    if (!m) return c.html(page('Your access was switched off', 'Ask the owner of your company’s Sign account.'), 403);
+    const { user, org } = m;
 
     // onAuthorize reads the request metadata the auth sub-app normally sets
     c.set('requestMetadata' as never, extractRequestMetadata(c.req.raw) as never);
     await onAuthorize({ userId: user.id }, c as never);
     const team = org.teams[0];
     return c.redirect(team ? `/t/${team.url}/documents` : '/');
+  })
+  .post('/session', async (c) => {
+    // The Asenay mobile app: same ticket as /sso, but answers with a team API token (public API v1)
+    // for the company's own organisation instead of a browser session. Nobody signs in again.
+    const body = await c.req.json().catch(() => ({}));
+    const t = verify((body as { t?: string }).t);
+    if (!t) return c.json({ error: 'invalid' }, 400);
+    const m = await ensure(t);
+    if (!m) return c.json({ error: 'disabled' }, 403);
+    const team = m.org.teams[0];
+    if (!team) return c.json({ error: 'no_team' }, 409);
+    await prisma.apiToken.deleteMany({ where: { userId: m.user.id, name: MOBILE_TOKEN, expires: { lt: new Date() } } });
+    const token = `api_${randomBytes(24).toString('base64url')}`;
+    const expires = new Date(Date.now() + MOBILE_TOKEN_HOURS * 3600 * 1000);
+    await prisma.apiToken.create({
+      data: { name: MOBILE_TOKEN, token: hashString(token), expires, userId: m.user.id, teamId: team.id },
+    });
+    return c.json({
+      token,
+      expires_at: expires.toISOString(),
+      team: { id: team.id, url: team.url, name: team.name },
+      user: { id: m.user.id, email: m.user.email, name: m.user.name },
+    });
   })
   .post('/purge', async (c) => {
     // Organisations of free-trial workspaces closed more than `days` days ago (default 30) are deleted with
